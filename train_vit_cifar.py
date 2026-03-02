@@ -30,6 +30,10 @@ CIFAR_MEAN = (0.4914, 0.4822, 0.4465)
 CIFAR_STD = (0.2470, 0.2435, 0.2616)
 
 
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     try:
@@ -302,6 +306,7 @@ def build_dataloaders(
     download: bool,
     pin_memory: bool,
 ) -> tuple[DataLoader, DataLoader, int]:
+    log("[setup] importing torchvision...")
     try:
         import torchvision
         from torchvision import transforms
@@ -310,6 +315,7 @@ def build_dataloaders(
             "torchvision is required. Install with: pip install torchvision"
         ) from exc
 
+    log(f"[setup] preparing transforms for dataset={dataset_name}")
     train_transform = transforms.Compose(
         [
             transforms.RandomCrop(32, padding=4),
@@ -326,12 +332,14 @@ def build_dataloaders(
     )
 
     if dataset_name == "cifar10":
+        log(f"[setup] building CIFAR10 train dataset (download={download})")
         train_ds = torchvision.datasets.CIFAR10(
             root=str(data_dir),
             train=True,
             transform=train_transform,
             download=download,
         )
+        log(f"[setup] building CIFAR10 val dataset (download={download})")
         test_ds = torchvision.datasets.CIFAR10(
             root=str(data_dir),
             train=False,
@@ -340,12 +348,14 @@ def build_dataloaders(
         )
         num_classes = 10
     elif dataset_name == "cifar100":
+        log(f"[setup] building CIFAR100 train dataset (download={download})")
         train_ds = torchvision.datasets.CIFAR100(
             root=str(data_dir),
             train=True,
             transform=train_transform,
             download=download,
         )
+        log(f"[setup] building CIFAR100 val dataset (download={download})")
         test_ds = torchvision.datasets.CIFAR100(
             root=str(data_dir),
             train=False,
@@ -356,6 +366,10 @@ def build_dataloaders(
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
+    log(
+        f"[setup] creating dataloaders: batch_size={batch_size}, eval_batch_size={eval_batch_size}, "
+        f"num_workers={num_workers}, pin_memory={pin_memory}"
+    )
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
@@ -373,6 +387,10 @@ def build_dataloaders(
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=num_workers > 0,
+    )
+    log(
+        f"[setup] dataloaders ready: train_samples={len(train_ds)}, val_samples={len(test_ds)}, "
+        f"train_batches={len(train_loader)}, val_batches={len(test_loader)}"
     )
     return train_loader, test_loader, num_classes
 
@@ -404,14 +422,27 @@ def train_one_epoch(
     scaler: Optional[torch.amp.GradScaler],
     grad_clip: float,
     use_amp: bool,
+    epoch: int,
+    total_epochs: int,
+    log_every_batches: int,
 ) -> tuple[float, float, float]:
     model.train()
     total_loss = 0.0
     total_correct = 0.0
     total_seen = 0
     start = time.perf_counter()
+    n_batches = len(loader)
+    log(
+        f"[train] epoch {epoch}/{total_epochs}: start "
+        f"(batches={n_batches}, amp={use_amp}, grad_clip={grad_clip})"
+    )
+    first_batch_wait_start = time.perf_counter()
 
-    for images, targets in loader:
+    for step, (images, targets) in enumerate(loader, start=1):
+        if step == 1:
+            first_batch_wait = time.perf_counter() - first_batch_wait_start
+            log(f"[train] epoch {epoch}/{total_epochs}: first batch loaded after {first_batch_wait:.2f}s")
+        step_start = time.perf_counter()
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         bsz = images.shape[0]
@@ -439,10 +470,29 @@ def train_one_epoch(
         total_loss += loss.item() * bsz
         total_correct += (logits.argmax(dim=1) == targets).float().sum().item()
         total_seen += bsz
+        step_seconds = time.perf_counter() - step_start
+
+        should_log_step = (
+            step == 1
+            or step == n_batches
+            or (log_every_batches > 0 and step % log_every_batches == 0)
+        )
+        if should_log_step:
+            running_loss = total_loss / max(total_seen, 1)
+            running_acc = (total_correct / max(total_seen, 1)) * 100.0
+            lr = optimizer.param_groups[0]["lr"]
+            log(
+                f"[train] epoch {epoch}/{total_epochs} step {step}/{n_batches} "
+                f"loss={running_loss:.4f} acc={running_acc:.2f}% lr={lr:.3e} step_s={step_seconds:.3f}"
+            )
 
     elapsed = time.perf_counter() - start
     avg_loss = total_loss / max(total_seen, 1)
     avg_acc = (total_correct / max(total_seen, 1)) * 100.0
+    log(
+        f"[train] epoch {epoch}/{total_epochs}: done "
+        f"loss={avg_loss:.4f} acc={avg_acc:.2f}% epoch_s={elapsed:.2f}"
+    )
     return avg_loss, avg_acc, elapsed
 
 
@@ -452,13 +502,22 @@ def evaluate(
     loader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
+    epoch: int,
+    total_epochs: int,
+    log_every_batches: int,
 ) -> tuple[float, float]:
     model.eval()
     total_loss = 0.0
     total_correct = 0.0
     total_seen = 0
+    n_batches = len(loader)
+    log(f"[eval] epoch {epoch}/{total_epochs}: start (batches={n_batches})")
+    first_batch_wait_start = time.perf_counter()
 
-    for images, targets in loader:
+    for step, (images, targets) in enumerate(loader, start=1):
+        if step == 1:
+            first_batch_wait = time.perf_counter() - first_batch_wait_start
+            log(f"[eval] epoch {epoch}/{total_epochs}: first batch loaded after {first_batch_wait:.2f}s")
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         logits = model(images)
@@ -468,8 +527,22 @@ def evaluate(
         total_correct += (logits.argmax(dim=1) == targets).float().sum().item()
         total_seen += bsz
 
+        should_log_step = (
+            step == 1
+            or step == n_batches
+            or (log_every_batches > 0 and step % log_every_batches == 0)
+        )
+        if should_log_step:
+            running_loss = total_loss / max(total_seen, 1)
+            running_acc = (total_correct / max(total_seen, 1)) * 100.0
+            log(
+                f"[eval] epoch {epoch}/{total_epochs} step {step}/{n_batches} "
+                f"loss={running_loss:.4f} acc={running_acc:.2f}%"
+            )
+
     avg_loss = total_loss / max(total_seen, 1)
     avg_acc = (total_correct / max(total_seen, 1)) * 100.0
+    log(f"[eval] epoch {epoch}/{total_epochs}: done loss={avg_loss:.4f} acc={avg_acc:.2f}%")
     return avg_loss, avg_acc
 
 
@@ -552,16 +625,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-dir", type=Path, default=Path("./results"))
     parser.add_argument("--run-name", type=str, default="")
     parser.add_argument("--save-checkpoint", action="store_true")
+    parser.add_argument(
+        "--log-every-batches",
+        type=int,
+        default=20,
+        help="Print intra-epoch train/eval progress every N batches (<=0 disables periodic logs)",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    log("[setup] parsed args")
     set_seed(args.seed)
+    log(f"[setup] seed set to {args.seed}")
 
     device = choose_device(args.device)
     pin_memory = device.type == "cuda"
+    log(f"[setup] using device={device} (requested={args.device})")
 
+    log(f"[setup] building dataloaders from data_dir={args.data_dir}")
     train_loader, val_loader, num_classes = build_dataloaders(
         dataset_name=args.dataset,
         data_dir=args.data_dir,
@@ -571,6 +654,7 @@ def main() -> None:
         download=args.download,
         pin_memory=pin_memory,
     )
+    log("[setup] dataloaders built")
 
     cfg = GibbsConfig(
         beta=args.gibbs_beta,
@@ -581,7 +665,12 @@ def main() -> None:
         logsumexp_eps=args.gibbs_logsumexp_eps,
         repulsion_lambda=args.gibbs_repulsion_lambda,
     )
+    log(
+        f"[setup] GibbsConfig: beta={cfg.beta}, steps={cfg.gibbs_steps}, runs={cfg.runs}, "
+        f"init={cfg.init}, init_p={cfg.init_p}"
+    )
 
+    log("[setup] building model")
     model = TinyViT(
         num_classes=num_classes,
         img_size=args.image_size,
@@ -603,6 +692,7 @@ def main() -> None:
         f2_neural_hidden=args.f2_neural_hidden,
         general_bias=args.general_bias,
     ).to(device)
+    log("[setup] model built and moved to device")
 
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     optimizer = torch.optim.AdamW(
@@ -618,11 +708,15 @@ def main() -> None:
     )
     use_amp = bool(args.amp and device.type == "cuda")
     scaler = torch.amp.GradScaler("cuda") if use_amp else None
+    log(
+        f"[setup] optimizer/scheduler ready: lr={args.lr}, wd={args.weight_decay}, "
+        f"warmup_epochs={args.warmup_epochs}, amp={use_amp}"
+    )
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"device={device}, attention={args.attention}, dataset={args.dataset}, params={n_params:,}")
+    log(f"device={device}, attention={args.attention}, dataset={args.dataset}, params={n_params:,}")
     if args.attention == "general":
-        print(
+        log(
             "general attention config:"
             f" f1={args.f1_type}, f2={args.f2_type}, "
             f"steps={args.gibbs_steps}, runs={args.gibbs_runs}, beta={args.gibbs_beta}"
@@ -634,6 +728,7 @@ def main() -> None:
     run_start = time.perf_counter()
 
     for epoch in range(1, args.epochs + 1):
+        log(f"[epoch] ===== epoch {epoch}/{args.epochs} =====")
         train_loss, train_acc, epoch_seconds = train_one_epoch(
             model=model,
             loader=train_loader,
@@ -644,12 +739,18 @@ def main() -> None:
             scaler=scaler,
             grad_clip=args.grad_clip,
             use_amp=use_amp,
+            epoch=epoch,
+            total_epochs=args.epochs,
+            log_every_batches=args.log_every_batches,
         )
         val_loss, val_acc = evaluate(
             model=model,
             loader=val_loader,
             criterion=criterion,
             device=device,
+            epoch=epoch,
+            total_epochs=args.epochs,
+            log_every_batches=args.log_every_batches,
         )
         current_lr = optimizer.param_groups[0]["lr"]
         imgs_sec = (len(train_loader) * args.batch_size) / max(epoch_seconds, 1e-9)
@@ -669,7 +770,7 @@ def main() -> None:
             best_val = val_acc
             best_epoch = epoch
 
-        print(
+        log(
             f"[{epoch:03d}/{args.epochs:03d}] "
             f"train_loss={train_loss:.4f} train_acc={train_acc:.2f}% "
             f"val_loss={val_loss:.4f} val_acc={val_acc:.2f}% "
@@ -703,13 +804,13 @@ def main() -> None:
     with summary_path.open("w", encoding="utf-8") as f:
         json.dump(out, f, indent=2)
 
-    print(f"done: best_val_acc={best_val:.2f}% at epoch {best_epoch}")
-    print(f"wrote summary: {summary_path}")
+    log(f"done: best_val_acc={best_val:.2f}% at epoch {best_epoch}")
+    log(f"wrote summary: {summary_path}")
 
     if args.save_checkpoint:
         ckpt_path = args.save_dir / f"{run_name}.pt"
         torch.save({"model": model.state_dict(), "config": json_safe_config(args)}, ckpt_path)
-        print(f"wrote checkpoint: {ckpt_path}")
+        log(f"wrote checkpoint: {ckpt_path}")
 
 
 if __name__ == "__main__":
