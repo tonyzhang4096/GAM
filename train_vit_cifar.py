@@ -573,9 +573,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", type=Path, default=Path("./data"))
     parser.add_argument("--download", action="store_true")
 
-    parser.add_argument("--attention", choices=["mha", "general"], default="mha")
+    parser.add_argument("--attention", choices=["mha", "general"], default="general")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=346511053)
 
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -607,11 +607,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--f2-type",
         choices=["modular_dot", "logsumexp", "dot_repulsion", "neural_mlp"],
-        default="logsumexp",
+        default="modular_dot",
     )
     parser.add_argument("--gibbs-beta", type=float, default=1.0)
-    parser.add_argument("--gibbs-steps", type=int, default=16)
-    parser.add_argument("--gibbs-runs", type=int, default=2)
+    parser.add_argument("--gibbs-steps", type=int, default=100)
+    parser.add_argument("--gibbs-runs", type=int, default=30)
     parser.add_argument("--gibbs-init", choices=["empty", "random"], default="empty")
     parser.add_argument("--gibbs-init-p", type=float, default=0.5)
     parser.add_argument("--gibbs-logsumexp-eps", type=float, default=1e-6)
@@ -628,7 +628,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--log-every-batches",
         type=int,
-        default=20,
+        default=10,
         help="Print intra-epoch train/eval progress every N batches (<=0 disables periodic logs)",
     )
     return parser.parse_args()
