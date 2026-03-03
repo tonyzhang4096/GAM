@@ -108,6 +108,7 @@ class GeneralSelfAttention(nn.Module):
     def __init__(
         self,
         dim: int,
+        num_heads: int,
         d_qk: Optional[int],
         cfg: GibbsConfig,
         f1_type: str,
@@ -116,29 +117,53 @@ class GeneralSelfAttention(nn.Module):
         f1_concat_max_set_size: int,
         f1_concat_hidden: int,
         f2_neural_hidden: int,
+        use_learned_tau: bool,
+        tau_init: float,
         proj_dropout: float,
         bias: bool,
     ):
         super().__init__()
-        self.attn = GeneralAttention(
-            d_model=dim,
-            d_qk=d_qk,
-            d_v=dim,
-            f2_type=f2_type,  # type: ignore[arg-type]
-            f1_type=f1_type,  # type: ignore[arg-type]
-            cfg=cfg,
-            query_chunk_size=query_chunk_size,
-            bias=bias,
-            f1_concat_max_set_size=f1_concat_max_set_size,
-            f1_concat_hidden=f1_concat_hidden,
-            f2_neural_hidden=f2_neural_hidden,
+        self.num_heads = int(num_heads)
+        if self.num_heads <= 0:
+            raise ValueError("num_heads must be > 0")
+        if dim % self.num_heads != 0:
+            raise ValueError("embed dim must be divisible by num_heads for general attention")
+        self.head_dim = dim // self.num_heads
+
+        if d_qk is None:
+            head_d_qk = self.head_dim
+        else:
+            if d_qk % self.num_heads != 0:
+                raise ValueError("general_d_qk must be divisible by num_heads")
+            head_d_qk = d_qk // self.num_heads
+
+        self.attn_heads = nn.ModuleList(
+            [
+                GeneralAttention(
+                    d_model=dim,
+                    d_qk=head_d_qk,
+                    d_v=self.head_dim,
+                    f2_type=f2_type,  # type: ignore[arg-type]
+                    f1_type=f1_type,  # type: ignore[arg-type]
+                    cfg=cfg,
+                    query_chunk_size=query_chunk_size,
+                    bias=bias,
+                    use_learned_tau=use_learned_tau,
+                    tau_init=tau_init,
+                    f1_concat_max_set_size=f1_concat_max_set_size,
+                    f1_concat_hidden=f1_concat_hidden,
+                    f2_neural_hidden=f2_neural_hidden,
+                )
+                for _ in range(self.num_heads)
+            ]
         )
         # MHA includes an output projection; mirror that here for fairer comparison.
         self.out_proj = nn.Linear(dim, dim, bias=True)
         self.proj_drop = nn.Dropout(proj_dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.attn(x)
+        head_outs = [attn(x) for attn in self.attn_heads]
+        y = torch.cat(head_outs, dim=-1)
         y = self.out_proj(y)
         return self.proj_drop(y)
 
@@ -179,6 +204,8 @@ class TransformerBlock(nn.Module):
         f1_concat_hidden: int,
         f2_neural_hidden: int,
         general_bias: bool,
+        use_learned_tau: bool,
+        tau_init: float,
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
@@ -187,6 +214,7 @@ class TransformerBlock(nn.Module):
         elif attention_type == "general":
             self.attn = GeneralSelfAttention(
                 dim=dim,
+                num_heads=num_heads,
                 d_qk=general_d_qk,
                 cfg=general_cfg,
                 f1_type=f1_type,
@@ -195,6 +223,8 @@ class TransformerBlock(nn.Module):
                 f1_concat_max_set_size=f1_concat_max_set_size,
                 f1_concat_hidden=f1_concat_hidden,
                 f2_neural_hidden=f2_neural_hidden,
+                use_learned_tau=use_learned_tau,
+                tau_init=tau_init,
                 proj_dropout=dropout,
                 bias=general_bias,
             )
@@ -231,6 +261,8 @@ class TinyViT(nn.Module):
         f1_concat_hidden: int,
         f2_neural_hidden: int,
         general_bias: bool,
+        use_learned_tau: bool,
+        tau_init: float,
     ):
         super().__init__()
         self.patch_embed = PatchEmbed(
@@ -262,6 +294,8 @@ class TinyViT(nn.Module):
                     f1_concat_hidden=f1_concat_hidden,
                     f2_neural_hidden=f2_neural_hidden,
                     general_bias=general_bias,
+                    use_learned_tau=use_learned_tau,
+                    tau_init=tau_init,
                 )
                 for _ in range(depth)
             ]
@@ -621,6 +655,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--f1-concat-hidden", type=int, default=128)
     parser.add_argument("--f2-neural-hidden", type=int, default=128)
     parser.add_argument("--general-bias", action="store_true")
+    parser.add_argument(
+        "--disable-learned-tau",
+        action="store_true",
+        help="Disable learned per-query threshold tau(q) in general attention.",
+    )
+    parser.add_argument(
+        "--tau-init",
+        type=float,
+        default=0.0,
+        help="Initial bias value for learned tau(q).",
+    )
 
     parser.add_argument("--save-dir", type=Path, default=Path("./results"))
     parser.add_argument("--run-name", type=str, default="")
@@ -697,6 +742,8 @@ def main() -> None:
         f1_concat_hidden=args.f1_concat_hidden,
         f2_neural_hidden=args.f2_neural_hidden,
         general_bias=args.general_bias,
+        use_learned_tau=not args.disable_learned_tau,
+        tau_init=args.tau_init,
     ).to(device)
     log("[setup] model built and moved to device")
 
@@ -725,7 +772,8 @@ def main() -> None:
         log(
             "general attention config:"
             f" f1={args.f1_type}, f2={args.f2_type}, "
-            f"steps={args.gibbs_steps}, runs={args.gibbs_runs}, beta={args.gibbs_beta}"
+            f"steps={args.gibbs_steps}, runs={args.gibbs_runs}, beta={args.gibbs_beta}, "
+            f"learned_tau={not args.disable_learned_tau}, tau_init={args.tau_init}"
         )
 
     metrics: list[EpochMetrics] = []

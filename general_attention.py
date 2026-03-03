@@ -182,6 +182,17 @@ class NeuralMLPF2(nn.Module):
         feat = torch.cat([q, mean_k, log_count], dim=-1)
         return self.mlp(feat).squeeze(-1)
 
+class QueryTau(nn.Module):
+    """Learnable per-query threshold tau(q) used in Gibbs logits."""
+    def __init__(self, d_qk: int, init_value: float = 0.0):
+        super().__init__()
+        self.proj = nn.Linear(d_qk, 1, bias=True)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.constant_(self.proj.bias, float(init_value))
+
+    def forward(self, q: torch.Tensor) -> torch.Tensor:
+        return self.proj(q).squeeze(-1)
+
 @dataclass
 class GibbsConfig:
     beta: float = 1.0
@@ -202,6 +213,7 @@ def _gibbs_sample_subsets(
     f2_type: F2Type,
     f1: SetAggregator,
     f2_neural: Optional[NeuralMLPF2] = None,
+    tau_fn: Optional[QueryTau] = None,
 ) -> torch.Tensor:
     if cfg.beta <= 0: raise ValueError("beta must be > 0")
     if cfg.gibbs_steps <= 0: raise ValueError("gibbs_steps must be > 0")
@@ -224,6 +236,7 @@ def _gibbs_sample_subsets(
 
     q_flat = q_f.reshape(n_queries, d_qk)
     q_rep = q_flat.repeat_interleave(cfg.runs, dim=0)  # (n_chains, d_qk)
+    tau_q = tau_fn(q_rep) if tau_fn is not None else None
 
     batch_for_query = torch.arange(B, device=device).repeat_interleave(Lq)
     batch_idx = batch_for_query.repeat_interleave(cfg.runs)
@@ -299,7 +312,11 @@ def _gibbs_sample_subsets(
         else:
             raise ValueError(f"Unknown f2_type: {f2_type}")
 
-        p_add = torch.sigmoid(beta * delta)
+        if tau_q is not None:
+            logits = beta * (delta - tau_q)
+        else:
+            logits = beta * delta
+        p_add = torch.sigmoid(logits)
         z = torch.rand((n_chains,), device=device)
         new_in_hard = z <= p_add
 
@@ -346,6 +363,8 @@ class GeneralAttention(nn.Module):
         cfg: Optional[GibbsConfig] = None,
         query_chunk_size: int = 128,
         bias: bool = False,
+        use_learned_tau: bool = True,
+        tau_init: float = 0.0,
         f1_concat_max_set_size: int = 8,
         f1_concat_hidden: int = 128,
         f2_neural_hidden: int = 128,
@@ -367,6 +386,7 @@ class GeneralAttention(nn.Module):
             concat_hidden=f1_concat_hidden,
         )
         self.f2_neural = NeuralMLPF2(self.d_qk, hidden=f2_neural_hidden) if self.f2_type == "neural_mlp" else None
+        self.tau_fn = QueryTau(self.d_qk, init_value=tau_init) if use_learned_tau else None
         self.cfg = cfg if cfg is not None else GibbsConfig()
 
         self.query_chunk_size = int(query_chunk_size)
@@ -399,6 +419,7 @@ class GeneralAttention(nn.Module):
                 f2_type=self.f2_type,
                 f1=self.f1,
                 f2_neural=self.f2_neural,
+                tau_fn=self.tau_fn,
             )
             outs.append(out_chunk)
         y = torch.cat(outs, dim=1)
