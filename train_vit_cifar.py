@@ -626,6 +626,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", type=str, default="")
     parser.add_argument("--save-checkpoint", action="store_true")
     parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=5,
+        help="Save a periodic checkpoint every N epochs (<=0 disables periodic checkpointing).",
+    )
+    parser.add_argument(
         "--log-every-batches",
         type=int,
         default=10,
@@ -726,6 +732,14 @@ def main() -> None:
     best_val = -1.0
     best_epoch = -1
     run_start = time.perf_counter()
+    run_name = args.run_name.strip()
+    if not run_name:
+        run_name = (
+            f"{args.dataset}_{args.attention}"
+            f"_d{args.embed_dim}_L{args.depth}"
+            f"_seed{args.seed}"
+        )
+    args.save_dir.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(1, args.epochs + 1):
         log(f"[epoch] ===== epoch {epoch}/{args.epochs} =====")
@@ -777,17 +791,23 @@ def main() -> None:
             f"lr={current_lr:.3e} imgs/s={imgs_sec:.1f}"
         )
 
+        if args.checkpoint_every > 0 and epoch % args.checkpoint_every == 0:
+            periodic_ckpt_path = args.save_dir / f"{run_name}_epoch{epoch:03d}.pt"
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "best_val_acc": best_val,
+                    "best_epoch": best_epoch,
+                    "config": json_safe_config(args),
+                },
+                periodic_ckpt_path,
+            )
+            log(f"[ckpt] wrote periodic checkpoint: {periodic_ckpt_path}")
+
     total_seconds = time.perf_counter() - run_start
-
-    run_name = args.run_name.strip()
-    if not run_name:
-        run_name = (
-            f"{args.dataset}_{args.attention}"
-            f"_d{args.embed_dim}_L{args.depth}"
-            f"_seed{args.seed}"
-        )
-
-    args.save_dir.mkdir(parents=True, exist_ok=True)
     summary_path = args.save_dir / f"{run_name}.json"
     out = {
         "run_name": run_name,
