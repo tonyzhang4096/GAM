@@ -9,11 +9,11 @@ Implements:
   - Approximate E using m independent runs of Algorithm 1 (random-scan Gibbs sampler)
     from Gotovos et al., "Sampling from Probabilistic Submodular Models" (NeurIPS 2015).
 
-We provide efficient F2 instantiations with O(d) incremental Δ updates:
+We provide F2 instantiations:
   1) modular_dot:   F(S) = Σ_{i∈S} a_i, a_i = <q,k_i>/√d
   2) logsumexp:     F(S) = log(ε + Σ_{i∈S} exp(a_i))
   3) dot_repulsion: F(S) = Σ_{i∈S} a_i - λ Σ_{i<j∈S} <k_i,k_j>/√d
-  4) neural_mlp:    F(S) = MLP([q, mean_k(S), log(1+|S|)])
+  4) neural_mlp:    F(S) = MLP([q, k_{i1}, ..., k_{ir} (padded), log(1+|S|)])
 
 and F1 instantiations:
   - mean
@@ -285,26 +285,75 @@ def build_f1(
     raise ValueError(f"Unknown f1_type: {f1_type}")
 
 class NeuralMLPF2(nn.Module):
-    """Learnable F2(S) conditioned on query q and subset key summary."""
-    def __init__(self, d_qk: int, hidden: int = 128, eps: float = 1e-8):
+    """Learnable F2(S) conditioned on query q and explicit subset keys."""
+
+    def __init__(
+        self,
+        d_qk: int,
+        hidden: int = 128,
+        eps: float = 1e-8,
+        max_set_size: Optional[int] = None,
+    ):
         super().__init__()
+        self.d_qk = int(d_qk)
         self.eps = float(eps)
+        self.max_set_size = int(max_set_size) if max_set_size is not None else None
+        if self.max_set_size is not None and self.max_set_size <= 0:
+            raise ValueError("f2 neural max_set_size must be > 0")
         self.mlp = nn.Sequential(
-            nn.Linear(2 * d_qk + 1, hidden),
+            nn.LazyLinear(hidden),
             nn.GELU(),
             nn.Linear(hidden, 1),
         )
 
-    def forward(
+    def _pack_subset_keys(
         self,
-        q: torch.Tensor,      # (n_chains, d_qk)
-        sum_k: torch.Tensor,  # (n_chains, d_qk)
-        count: torch.Tensor,  # (n_chains,)
+        k: torch.Tensor,          # (B, L, d_qk)
+        batch_idx: torch.Tensor,  # (n_chains,)
+        mask: torch.Tensor,       # (n_chains, L) bool
     ) -> torch.Tensor:
-        denom = count.to(sum_k.dtype).clamp_min(self.eps).unsqueeze(-1)
-        mean_k = sum_k / denom
-        log_count = torch.log1p(count.to(sum_k.dtype)).unsqueeze(-1)
-        feat = torch.cat([q, mean_k, log_count], dim=-1)
+        n_chains, L = mask.shape
+        chain_k = k[batch_idx]  # (n_chains, L, d_qk)
+        d_qk = chain_k.shape[-1]
+        if d_qk != self.d_qk:
+            raise ValueError("NeuralMLPF2 d_qk mismatch")
+
+        keep = L if self.max_set_size is None else min(self.max_set_size, L)
+        if keep > 0:
+            pos = torch.arange(L, device=mask.device, dtype=torch.float32)
+            scores = mask.to(torch.float32) * (float(L) - pos).unsqueeze(0)
+            top_scores, top_idx = torch.topk(scores, k=keep, dim=1)
+            picked = top_scores > 0
+
+            sentinel = torch.full_like(top_idx, L)
+            sortable = torch.where(picked, top_idx, sentinel)
+            sortable, order = torch.sort(sortable, dim=1)
+            picked = torch.gather(picked, 1, order)
+
+            safe_idx = torch.where(picked, sortable, torch.zeros_like(sortable))
+            gather_idx = safe_idx.unsqueeze(-1).expand(-1, -1, d_qk)
+            packed = torch.gather(chain_k, 1, gather_idx)
+            packed = packed * picked.unsqueeze(-1).to(packed.dtype)
+        else:
+            packed = chain_k.new_zeros((n_chains, 0, d_qk))
+
+        if self.max_set_size is not None and keep < self.max_set_size:
+            pad = chain_k.new_zeros((n_chains, self.max_set_size - keep, d_qk))
+            packed = torch.cat([packed, pad], dim=1)
+
+        return packed.reshape(n_chains, -1)
+
+    def forward_subset(
+        self,
+        q: torch.Tensor,          # (n_chains, d_qk)
+        k: torch.Tensor,          # (B, L, d_qk)
+        batch_idx: torch.Tensor,  # (n_chains,)
+        mask: torch.Tensor,       # (n_chains, L) bool
+        count: torch.Tensor,      # (n_chains,)
+    ) -> torch.Tensor:
+        packed = self._pack_subset_keys(k=k, batch_idx=batch_idx, mask=mask)
+        log_count = torch.log1p(count.to(q.dtype)).unsqueeze(-1)
+        feat = torch.cat([q, packed.to(q.dtype), log_count], dim=-1)
         return self.mlp(feat).squeeze(-1)
 
 class QueryTau(nn.Module):
@@ -353,7 +402,7 @@ def _gibbs_sample_subsets(
     device = q.device
     q_f, k_f, v_f = q.float(), k.float(), v.float()
     scale = 1.0 / math.sqrt(d_qk)
-    needs_sum_k = f2_type in ("dot_repulsion", "neural_mlp")
+    needs_sum_k = f2_type == "dot_repulsion"
     needs_sum_w = f2_type == "logsumexp"
 
     n_queries = B * Lq
@@ -425,14 +474,20 @@ def _gibbs_sample_subsets(
         elif f2_type == "neural_mlp":
             if f2_neural is None:
                 raise ValueError("f2_type='neural_mlp' requires a neural F2 module")
-            assert sum_k is not None
-            old_f = old_in.to(sum_k.dtype).unsqueeze(-1)
-            sum_k_excl = sum_k - old_f * kv
+
+            mask_excl = mask.clone()
+            mask_excl[chain_ids, vidx] = False
+            mask_add = mask_excl.clone()
+            mask_add[chain_ids, vidx] = True
+
             count_excl = count - old_in.to(count.dtype)
-            sum_k_add = sum_k_excl + kv
             count_add = count_excl + 1
-            e_excl = f2_neural(q_rep, sum_k_excl, count_excl.to(sum_k_excl.dtype))
-            e_add = f2_neural(q_rep, sum_k_add, count_add.to(sum_k_add.dtype))
+            e_excl = f2_neural.forward_subset(
+                q=q_rep, k=k_f, batch_idx=batch_idx, mask=mask_excl, count=count_excl
+            )
+            e_add = f2_neural.forward_subset(
+                q=q_rep, k=k_f, batch_idx=batch_idx, mask=mask_add, count=count_add
+            )
             delta = e_add - e_excl
         else:
             raise ValueError(f"Unknown f2_type: {f2_type}")
@@ -460,7 +515,7 @@ def _gibbs_sample_subsets(
         count = count + sign_hard.to(torch.int32)
         count_f = count_f + sign
         sum_v = sum_v + sign.unsqueeze(-1) * vv
-        if f2_type in ("dot_repulsion", "neural_mlp"):
+        if f2_type == "dot_repulsion":
             sum_k = sum_k + sign_hard.unsqueeze(-1) * kv
         elif f2_type == "logsumexp":
             sum_w = sum_w + sign_hard * torch.exp(a_v)
