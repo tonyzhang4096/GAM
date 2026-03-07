@@ -310,8 +310,13 @@ class TinyViT(nn.Module):
     @staticmethod
     def _init_weights(m: nn.Module) -> None:
         if isinstance(m, nn.Linear):
+            # Skip lazy modules until first forward materializes their parameters.
+            if isinstance(m.weight, torch.nn.parameter.UninitializedParameter):
+                return
             nn.init.trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:
+                if isinstance(m.bias, torch.nn.parameter.UninitializedParameter):
+                    return
                 nn.init.zeros_(m.bias)
         elif isinstance(m, nn.LayerNorm):
             nn.init.ones_(m.weight)
