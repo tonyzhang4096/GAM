@@ -130,7 +130,7 @@ class ConcatMLPAggregator(SetAggregator):
     Selects up to `max_set_size` members from S by relevance, zero-pads if needed,
     concatenates them, appends log(1+|S|), and applies an MLP.
     """
-    def __init__(self, d_v: int, max_set_size: int = 16, hidden: int = 128):
+    def __init__(self, d_v: int, max_set_size: int = 8, hidden: int = 128):
         super().__init__()
         self.d_v = int(d_v)
         self.max_set_size = int(max_set_size)
@@ -184,7 +184,7 @@ class TransformerSubsetAggregator(SetAggregator):
     def __init__(
         self,
         d_v: int,
-        max_set_size: int = 16,
+        max_set_size: int = 8,
         hidden: int = 128,
         num_layers: int = 1,
         num_heads: int = 4,
@@ -281,7 +281,7 @@ def build_f1(
     f1_type: F1Type,
     d_v: int,
     *,
-    concat_max_set_size: int = 16,
+    concat_max_set_size: int = 8,
     concat_hidden: int = 128,
 ) -> SetAggregator:
     if f1_type == "mean":
@@ -310,7 +310,7 @@ class NeuralMLPF2(nn.Module):
         d_qk: int,
         hidden: int = 128,
         eps: float = 1e-8,
-        max_set_size: int = 16,
+        max_set_size: int = 8,
     ):
         super().__init__()
         self.d_qk = int(d_qk)
@@ -568,7 +568,7 @@ class GeneralAttention(nn.Module):
         bias: bool = False,
         use_learned_tau: bool = True,
         tau_init: float = 0.0,
-        f1_concat_max_set_size: int = 16,
+        f1_concat_max_set_size: int = 8,
         f1_concat_hidden: int = 128,
         f2_neural_hidden: int = 128,
     ):

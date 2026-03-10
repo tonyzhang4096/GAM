@@ -679,7 +679,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--f1-concat-max-set-size",
         type=int,
-        default=16,
+        default=8,
         help=(
             "Max selected subset tokens for explicit subset modules "
             "(f1=mlp_concat/transformer and f2=neural_mlp key packing)."
