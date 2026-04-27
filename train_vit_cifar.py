@@ -537,9 +537,14 @@ def train_one_epoch(
             running_loss = total_loss / max(total_seen, 1)
             running_acc = (total_correct / max(total_seen, 1)) * 100.0
             lr = optimizer.param_groups[0]["lr"]
+            pct = step / n_batches * 100.0
+            elapsed_so_far = time.perf_counter() - start
+            imgs_per_sec = total_seen / max(elapsed_so_far, 1e-6)
+            eta = (elapsed_so_far / step) * (n_batches - step) if step > 0 else 0.0
             log(
-                f"[train] epoch {epoch}/{total_epochs} step {step}/{n_batches} "
-                f"loss={running_loss:.4f} acc={running_acc:.2f}% lr={lr:.3e} step_s={step_seconds:.3f}"
+                f"[train] epoch {epoch}/{total_epochs} batch {step}/{n_batches} ({pct:.1f}%) "
+                f"loss={running_loss:.4f} acc={running_acc:.2f}% lr={lr:.3e} "
+                f"speed={imgs_per_sec:.1f} img/s ETA={eta:.0f}s"
             )
 
     elapsed = time.perf_counter() - start
@@ -569,6 +574,7 @@ def evaluate(
     n_batches = len(loader)
     log(f"[eval] epoch {epoch}/{total_epochs}: start (batches={n_batches})")
     first_batch_wait_start = time.perf_counter()
+    eval_start = time.perf_counter()
 
     for step, (images, targets) in enumerate(loader, start=1):
         if step == 1:
@@ -591,9 +597,12 @@ def evaluate(
         if should_log_step:
             running_loss = total_loss / max(total_seen, 1)
             running_acc = (total_correct / max(total_seen, 1)) * 100.0
+            pct = step / n_batches * 100.0
+            elapsed_so_far = time.perf_counter() - eval_start
+            imgs_per_sec = total_seen / max(elapsed_so_far, 1e-6)
             log(
-                f"[eval] epoch {epoch}/{total_epochs} step {step}/{n_batches} "
-                f"loss={running_loss:.4f} acc={running_acc:.2f}%"
+                f"[eval] epoch {epoch}/{total_epochs} batch {step}/{n_batches} ({pct:.1f}%) "
+                f"loss={running_loss:.4f} acc={running_acc:.2f}% speed={imgs_per_sec:.1f} img/s"
             )
 
     avg_loss = total_loss / max(total_seen, 1)
