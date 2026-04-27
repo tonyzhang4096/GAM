@@ -709,6 +709,16 @@ def parse_args() -> argparse.Namespace:
             "restricted_softmax is already query-conditioned and requires none."
         ),
     )
+    parser.add_argument(
+        "--gradient-method",
+        choices=["ste", "gumbel"],
+        default="ste",
+        help="Gradient method for discrete sampling: ste (straight-through) or gumbel (Gumbel-Softmax).",
+    )
+    parser.add_argument("--gumbel-tau-start", type=float, default=1.0,
+                        help="Gumbel-Softmax initial temperature.")
+    parser.add_argument("--gumbel-tau-min", type=float, default=0.1,
+                        help="Gumbel-Softmax minimum temperature after annealing.")
     parser.add_argument("--gibbs-beta", type=float, default=1.0)
     parser.add_argument("--gibbs-steps", type=int, default=100)
     parser.add_argument("--gibbs-runs", type=int, default=30)
@@ -804,10 +814,14 @@ def main() -> None:
         logsumexp_eps=args.gibbs_logsumexp_eps,
         repulsion_lambda=args.gibbs_repulsion_lambda,
         st_gradient_mode=args.st_gradient_mode,  # type: ignore[arg-type]
+        gradient_method=args.gradient_method,  # type: ignore[arg-type]
+        gumbel_tau=args.gumbel_tau_start,
+        gumbel_tau_min=args.gumbel_tau_min,
     )
     log(
         f"[setup] GibbsConfig: beta={cfg.beta}, steps={cfg.gibbs_steps}, runs={cfg.runs}, "
-        f"init={cfg.init}, init_p={cfg.init_p}, st_gradient_mode={cfg.st_gradient_mode}"
+        f"init={cfg.init}, init_p={cfg.init_p}, st_gradient_mode={cfg.st_gradient_mode}, "
+        f"gradient_method={cfg.gradient_method}, gumbel_tau={cfg.gumbel_tau}"
     )
 
     log("[setup] building model")
@@ -886,6 +900,11 @@ def main() -> None:
     args.save_dir.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(1, args.epochs + 1):
+        if cfg.gradient_method == "gumbel":
+            progress = (epoch - 1) / max(args.epochs - 1, 1)
+            cfg.gumbel_tau = args.gumbel_tau_start - progress * (args.gumbel_tau_start - args.gumbel_tau_min)
+            cfg.gumbel_tau = max(cfg.gumbel_tau, args.gumbel_tau_min)
+            log(f"[epoch] gumbel_tau={cfg.gumbel_tau:.4f}")
         log(f"[epoch] ===== epoch {epoch}/{args.epochs} =====")
         train_loss, train_acc, epoch_seconds = train_one_epoch(
             model=model,

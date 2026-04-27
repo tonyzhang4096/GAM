@@ -48,6 +48,7 @@ F2Type = Literal[
 F1Type = Literal["mean", "mlp_mean", "mlp_concat", "transformer", "restricted_softmax"]
 InitType = Literal["empty", "random"]
 STGradientMode = Literal["partial", "consistent"]
+GradientMethod = Literal["ste", "gumbel"]
 F1QueryMode = Literal["none", "replace", "add"]
 
 class SetAggregator(nn.Module):
@@ -524,6 +525,9 @@ class GibbsConfig:
     straight_through: bool = True
     # partial: update sampler side-state with hard sign; consistent: use ST sign.
     st_gradient_mode: STGradientMode = "partial"
+    gradient_method: GradientMethod = "ste"
+    gumbel_tau: float = 1.0
+    gumbel_tau_min: float = 0.1
 
 def _gibbs_sample_subsets(
     q: torch.Tensor,     # (B, Lq, d_qk)
@@ -685,19 +689,41 @@ def _gibbs_sample_subsets(
         else:
             logits = beta * delta
         p_add = torch.sigmoid(logits)
-        z = torch.rand((n_chains,), device=device)
-        new_in_hard = z <= p_add
 
         old_f = old_in.to(work_dtype)
-        new_f_hard = new_in_hard.to(work_dtype)
-        sign_hard = new_f_hard - old_f
 
-        # Forward path stays hard Bernoulli; backward path follows p_add.
-        if cfg.straight_through:
-            new_f = new_f_hard.detach() - p_add.detach() + p_add
+        if cfg.gradient_method == "gumbel":
+            # Gumbel-Softmax: differentiable relaxation of the binary decision.
+            # Sample Gumbel noise for both include/exclude logits.
+            tau = max(cfg.gumbel_tau, 1e-6)
+            log_probs = torch.stack([
+                torch.log1p(-p_add + 1e-8),  # log(1 - p_add): exclude
+                torch.log(p_add + 1e-8),       # log(p_add): include
+            ], dim=-1)  # (n_chains, 2)
+            gumbel_noise = -torch.log(-torch.log(
+                torch.rand_like(log_probs).clamp(1e-8, 1 - 1e-8)
+            ))
+            gumbel_logits = (log_probs + gumbel_noise) / tau
+            soft_samples = torch.softmax(gumbel_logits, dim=-1)
+            new_f_soft = soft_samples[:, 1]  # probability of "include"
+            # Hard sample for mask updates, soft for gradient flow
+            new_in_hard = (new_f_soft > 0.5)
+            new_f_hard = new_in_hard.to(work_dtype)
+            sign_hard = new_f_hard - old_f
+            # Straight-through: hard forward, soft backward
+            new_f = new_f_hard.detach() - new_f_soft.detach() + new_f_soft
             sign = new_f - old_f
         else:
-            sign = sign_hard
+            # STE (original behavior)
+            z = torch.rand((n_chains,), device=device)
+            new_in_hard = z <= p_add
+            new_f_hard = new_in_hard.to(work_dtype)
+            sign_hard = new_f_hard - old_f
+            if cfg.straight_through:
+                new_f = new_f_hard.detach() - p_add.detach() + p_add
+                sign = new_f - old_f
+            else:
+                sign = sign_hard
 
         mask[chain_ids, vidx] = new_in_hard
         count = count + sign_hard.to(torch.int32)
