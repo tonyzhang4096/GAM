@@ -48,7 +48,7 @@ F2Type = Literal[
 F1Type = Literal["mean", "mlp_mean", "mlp_concat", "transformer", "restricted_softmax"]
 InitType = Literal["empty", "random"]
 STGradientMode = Literal["partial", "consistent"]
-GradientMethod = Literal["ste", "gumbel"]
+GradientMethod = Literal["ste", "gumbel", "reinforce"]
 F1QueryMode = Literal["none", "replace", "add"]
 
 class SetAggregator(nn.Module):
@@ -540,7 +540,7 @@ def _gibbs_sample_subsets(
     tau_fn: Optional[QueryTau] = None,
     f1_query_mode: F1QueryMode = "none",
     f1_query_max_set_size: int = 8,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     if cfg.beta <= 0: raise ValueError("beta must be > 0")
     if cfg.gibbs_steps <= 0: raise ValueError("gibbs_steps must be > 0")
     if cfg.runs <= 0: raise ValueError("runs must be > 0")
@@ -609,6 +609,8 @@ def _gibbs_sample_subsets(
     # --- Algorithm 1 Gibbs loop ---
     chain_ids = torch.arange(n_chains, device=device)
     beta = float(cfg.beta)
+    use_reinforce = cfg.gradient_method == "reinforce"
+    total_log_prob = torch.zeros((n_chains,), device=device, dtype=work_dtype) if use_reinforce else None
 
     for _ in range(int(cfg.gibbs_steps)):
         vidx = torch.randint(0, L, (n_chains,), device=device)
@@ -694,19 +696,28 @@ def _gibbs_sample_subsets(
 
         if cfg.gradient_method == "gumbel":
             # Gumbel-Softmax: differentiable relaxation of the binary decision.
-            # Work directly with logits (numerically stable) instead of log-probs.
             tau = max(cfg.gumbel_tau, 1e-6)
-            binary_logits = torch.stack([-logits, logits], dim=-1)  # (n_chains, 2): [exclude, include]
+            binary_logits = torch.stack([-logits, logits], dim=-1)
             soft_samples = torch.nn.functional.gumbel_softmax(
                 binary_logits, tau=tau, hard=False, dim=-1,
             )
-            new_f_soft = soft_samples[:, 1]  # soft "include" probability
+            new_f_soft = soft_samples[:, 1]
             new_in_hard = (new_f_soft > 0.5)
             new_f_hard = new_in_hard.to(work_dtype)
             sign_hard = new_f_hard - old_f
-            # Straight-through: hard forward, soft backward
             new_f = new_f_hard.detach() - new_f_soft.detach() + new_f_soft
             sign = new_f - old_f
+        elif cfg.gradient_method == "reinforce":
+            # REINFORCE: hard sampling, accumulate log-probs for policy gradient.
+            p_add_clamped = p_add.detach().clamp(1e-6, 1 - 1e-6)
+            z = torch.rand((n_chains,), device=device)
+            new_in_hard = z <= p_add_clamped
+            new_f_hard = new_in_hard.to(work_dtype)
+            sign_hard = new_f_hard - old_f
+            sign = sign_hard
+            # Accumulate log P(action) = a*log(p) + (1-a)*log(1-p)
+            log_p = new_f_hard * torch.log(p_add_clamped) + (1.0 - new_f_hard) * torch.log1p(-p_add_clamped)
+            total_log_prob = total_log_prob + log_p
         else:
             # STE (original behavior)
             z = torch.rand((n_chains,), device=device)
@@ -745,7 +756,10 @@ def _gibbs_sample_subsets(
         f1_query_max_set_size=f1_query_max_set_size,
     )
     out = out_chain.view(B, Lq, cfg.runs, d_v).mean(dim=2)
-    return out
+    # For REINFORCE: average log_prob over runs, then reshape to (B, Lq)
+    if total_log_prob is not None:
+        total_log_prob = total_log_prob.view(B, Lq, cfg.runs).mean(dim=2)
+    return out, total_log_prob
 
 
 def _apply_f1_to_support(
@@ -835,7 +849,7 @@ def _deterministic_full_set_output(
             )
         # Exact-special-case path: ordinary scaled dot-product attention.
         weights = torch.softmax(rank_scores, dim=-1)
-        return weights @ v
+        return weights @ v, None
 
     n_supports = B * Lq
     batch_idx = torch.arange(B, device=q.device).repeat_interleave(Lq)
@@ -855,7 +869,7 @@ def _deterministic_full_set_output(
         f1_query_mode=f1_query_mode,
         f1_query_max_set_size=f1_query_max_set_size,
     )
-    return out.view(B, Lq, d_v)
+    return out.view(B, Lq, d_v), None
 
 class GeneralAttention(nn.Module):
     """General subset attention.
@@ -924,7 +938,7 @@ class GeneralAttention(nn.Module):
         if self.query_chunk_size <= 0:
             raise ValueError("query_chunk_size must be > 0")
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         squeeze_batch = False
         if x.dim() == 2:
             x = x.unsqueeze(0)
@@ -941,11 +955,12 @@ class GeneralAttention(nn.Module):
         v = self.W_V(x)
 
         outs = []
+        log_probs = []
         for start in range(0, L, self.query_chunk_size):
             end = min(L, start + self.query_chunk_size)
             q_chunk = q[:, start:end, :]
             if self.f2_type == "full_set":
-                out_chunk = _deterministic_full_set_output(
+                out_chunk, lp_chunk = _deterministic_full_set_output(
                     q=q_chunk,
                     k=k,
                     v=v,
@@ -954,7 +969,7 @@ class GeneralAttention(nn.Module):
                     f1_query_max_set_size=self.f1_concat_max_set_size,
                 )
             else:
-                out_chunk = _gibbs_sample_subsets(
+                out_chunk, lp_chunk = _gibbs_sample_subsets(
                     q=q_chunk, k=k, v=v,
                     cfg=self.cfg,
                     f2_type=self.f2_type,
@@ -965,5 +980,10 @@ class GeneralAttention(nn.Module):
                     f1_query_max_set_size=self.f1_concat_max_set_size,
                 )
             outs.append(out_chunk)
+            if lp_chunk is not None:
+                log_probs.append(lp_chunk)
         y = torch.cat(outs, dim=1)
-        return y.squeeze(0) if squeeze_batch else y
+        if squeeze_batch:
+            y = y.squeeze(0)
+        total_lp = torch.cat(log_probs, dim=1).mean() if log_probs else None
+        return y, total_lp

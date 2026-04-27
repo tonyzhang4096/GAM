@@ -163,11 +163,14 @@ class GeneralSelfAttention(nn.Module):
         self.out_proj = nn.Linear(dim, dim, bias=True)
         self.proj_drop = nn.Dropout(proj_dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         head_outs = [attn(x) for attn in self.attn_heads]
-        y = torch.cat(head_outs, dim=-1)
+        ys = [h[0] for h in head_outs]
+        lps = [h[1] for h in head_outs if h[1] is not None]
+        y = torch.cat(ys, dim=-1)
         y = self.out_proj(y)
-        return self.proj_drop(y)
+        total_lp = torch.stack(lps).mean() if lps else None
+        return self.proj_drop(y), total_lp
 
 
 class MLP(nn.Module):
@@ -237,10 +240,15 @@ class TransformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = MLP(dim, hidden_dim=int(dim * mlp_ratio), dropout=dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x))
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        attn_out = self.attn(self.norm1(x))
+        if isinstance(attn_out, tuple):
+            attn_val, lp = attn_out
+        else:
+            attn_val, lp = attn_out, None
+        x = x + attn_val
         x = x + self.mlp(self.norm2(x))
-        return x
+        return x, lp
 
 
 class TinyViT(nn.Module):
@@ -328,18 +336,22 @@ class TinyViT(nn.Module):
             nn.init.ones_(m.weight)
             nn.init.zeros_(m.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         x = self.patch_embed(x)
         bsz = x.shape[0]
         cls = self.cls_token.expand(bsz, -1, -1)
         x = torch.cat([cls, x], dim=1)
         x = x + self.pos_embed[:, : x.shape[1]]
         x = self.pos_drop(x)
+        all_lps = []
         for blk in self.blocks:
-            x = blk(x)
+            x, lp = blk(x)
+            if lp is not None:
+                all_lps.append(lp)
         x = self.norm(x)
         logits = self.head(x[:, 0])
-        return logits
+        total_lp = torch.stack(all_lps).mean() if all_lps else None
+        return logits, total_lp
 
 
 def build_dataloaders(
@@ -481,6 +493,8 @@ def train_one_epoch(
     epoch: int,
     total_epochs: int,
     log_every_batches: int,
+    reinforce_baseline: Optional[list] = None,
+    reinforce_baseline_decay: float = 0.99,
 ) -> tuple[float, float, float]:
     model.train()
     total_loss = 0.0
@@ -506,7 +520,7 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         if use_amp and scaler is not None:
             with torch.autocast(device_type="cuda", dtype=torch.float16):
-                logits = model(images)
+                logits, log_prob = model(images)
                 loss = criterion(logits, targets)
             scaler.scale(loss).backward()
             if grad_clip > 0:
@@ -515,8 +529,17 @@ def train_one_epoch(
             scaler.step(optimizer)
             scaler.update()
         else:
-            logits = model(images)
-            loss = criterion(logits, targets)
+            logits, log_prob = model(images)
+            task_loss = criterion(logits, targets)
+            if log_prob is not None and reinforce_baseline is not None:
+                reward = -task_loss.detach()
+                baseline = reinforce_baseline[0]
+                advantage = reward - baseline
+                reinforce_loss = -(advantage * log_prob)
+                loss = task_loss + reinforce_loss
+                reinforce_baseline[0] = reinforce_baseline_decay * baseline + (1 - reinforce_baseline_decay) * reward.item()
+            else:
+                loss = task_loss
             loss.backward()
             if grad_clip > 0:
                 nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -582,7 +605,7 @@ def evaluate(
             log(f"[eval] epoch {epoch}/{total_epochs}: first batch loaded after {first_batch_wait:.2f}s")
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
-        logits = model(images)
+        logits, _ = model(images)
         loss = criterion(logits, targets)
         bsz = images.shape[0]
         total_loss += loss.item() * bsz
@@ -711,10 +734,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--gradient-method",
-        choices=["ste", "gumbel"],
+        choices=["ste", "gumbel", "reinforce"],
         default="ste",
-        help="Gradient method for discrete sampling: ste (straight-through) or gumbel (Gumbel-Softmax).",
+        help="Gradient method for discrete sampling: ste (straight-through), gumbel (Gumbel-Softmax), or reinforce (policy gradient).",
     )
+    parser.add_argument("--reinforce-baseline-decay", type=float, default=0.99,
+                        help="EMA decay for REINFORCE reward baseline.")
     parser.add_argument("--gumbel-tau-start", type=float, default=1.0,
                         help="Gumbel-Softmax initial temperature.")
     parser.add_argument("--gumbel-tau-min", type=float, default=0.1,
@@ -898,6 +923,7 @@ def main() -> None:
             f"_seed{args.seed}"
         )
     args.save_dir.mkdir(parents=True, exist_ok=True)
+    reinforce_baseline = [0.0] if args.gradient_method == "reinforce" else None
 
     for epoch in range(1, args.epochs + 1):
         if cfg.gradient_method == "gumbel":
@@ -919,6 +945,8 @@ def main() -> None:
             epoch=epoch,
             total_epochs=args.epochs,
             log_every_batches=args.log_every_batches,
+            reinforce_baseline=reinforce_baseline,
+            reinforce_baseline_decay=args.reinforce_baseline_decay,
         )
         val_loss, val_acc = evaluate(
             model=model,

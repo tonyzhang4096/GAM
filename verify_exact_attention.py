@@ -28,7 +28,7 @@ def main() -> None:
     ).eval()
 
     with torch.no_grad():
-        y = attn(x)
+        y, _ = attn(x)
         q = attn.W_Q(x)
         k = attn.W_K(x)
         v = attn.W_V(x)
