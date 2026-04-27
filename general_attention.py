@@ -694,19 +694,13 @@ def _gibbs_sample_subsets(
 
         if cfg.gradient_method == "gumbel":
             # Gumbel-Softmax: differentiable relaxation of the binary decision.
-            # Sample Gumbel noise for both include/exclude logits.
+            # Work directly with logits (numerically stable) instead of log-probs.
             tau = max(cfg.gumbel_tau, 1e-6)
-            log_probs = torch.stack([
-                torch.log1p(-p_add + 1e-8),  # log(1 - p_add): exclude
-                torch.log(p_add + 1e-8),       # log(p_add): include
-            ], dim=-1)  # (n_chains, 2)
-            gumbel_noise = -torch.log(-torch.log(
-                torch.rand_like(log_probs).clamp(1e-8, 1 - 1e-8)
-            ))
-            gumbel_logits = (log_probs + gumbel_noise) / tau
-            soft_samples = torch.softmax(gumbel_logits, dim=-1)
-            new_f_soft = soft_samples[:, 1]  # probability of "include"
-            # Hard sample for mask updates, soft for gradient flow
+            binary_logits = torch.stack([-logits, logits], dim=-1)  # (n_chains, 2): [exclude, include]
+            soft_samples = torch.nn.functional.gumbel_softmax(
+                binary_logits, tau=tau, hard=False, dim=-1,
+            )
+            new_f_soft = soft_samples[:, 1]  # soft "include" probability
             new_in_hard = (new_f_soft > 0.5)
             new_f_hard = new_in_hard.to(work_dtype)
             sign_hard = new_f_hard - old_f
